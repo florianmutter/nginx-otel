@@ -20,14 +20,18 @@ http {
     ssl_certificate localhost.crt;
     ssl_certificate_key localhost.key;
 
+    {% if exporter is not none %}
     otel_exporter {
+        {% if endpoint is not none %}
         endpoint {{ endpoint or "127.0.0.1:14317" }};
+        {% endif %}
         interval {{ interval or "1ms" }};
         batch_size 3;
         batch_count 3;
 
         {{ exporter_opts }}
     }
+    {% endif %}
 
     otel_trace on;
     {{ resource_attrs }}
@@ -408,3 +412,104 @@ def test_resource_env(client, trace_service, attrs):
 
     for name, value in attrs.items():
         assert get_attr(batch.resource, name) == value
+
+
+@pytest.mark.parametrize(
+    ("nginx_env", "nginx_config"),
+    [
+        (
+            {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:14317"},
+            {"endpoint": None},
+        ),
+        (
+            {"OTEL_EXPORTER_OTLP_ENDPOINT": "https://localhost:14318"},
+            {
+                "endpoint": None,
+                "exporter_opts": "trusted_certificate localhost.crt;",
+            },
+        ),
+        (
+            {
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "127.0.0.1:14317",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "127.0.0.1:1",
+            },
+            {"endpoint": None},
+        ),
+        (
+            {
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "127.0.0.1:1",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "127.0.0.1:1",
+            },
+            {},
+        ),
+    ],
+    indirect=True,
+)
+def test_exporter_endpoint_env(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/ok").status_code == 200
+
+    assert trace_service.get_span().name == "/ok"
+
+
+@pytest.mark.parametrize(
+    "nginx_env",
+    [{"OTEL_EXPORTER_OTLP_ENDPOINT": "127.0.0.1:14317"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("nginx_config", [{"exporter": None}], indirect=True)
+def test_exporter_endpoint_env_no_block(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/ok").status_code == 200
+
+    for _ in range(100):  # wait for default 5s export interval
+        if len(trace_service.batches):
+            break
+        time.sleep(0.1)
+
+    assert trace_service.get_span().name == "/ok"
+
+
+@pytest.mark.parametrize(
+    ("nginx_env", "headers"),
+    [
+        (
+            {
+                "OTEL_EXPORTER_OTLP_HEADERS": (
+                    "X-API-TOKEN=env.value, Authorization = Basic%20env"
+                )
+            },
+            {"x-api-token": "api.value", "authorization": "Basic env"},
+        ),
+        (
+            {
+                "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "x-traces=traces",
+                "OTEL_EXPORTER_OTLP_HEADERS": "x-generic=generic",
+            },
+            {"x-traces": "traces", "x-generic": None},
+        ),
+        (
+            {"OTEL_EXPORTER_OTLP_HEADERS": "x-valid=valid,x invalid=value"},
+            {"x-api-token": "api.value", "x-valid": None},
+        ),
+        (
+            {"OTEL_EXPORTER_OTLP_HEADERS": "x-valid=valid,x-invalid=%0A"},
+            {"x-api-token": "api.value", "x-valid": None},
+        ),
+    ],
+    indirect=["nginx_env"],
+)
+@pytest.mark.parametrize(
+    "nginx_config",
+    [{"exporter_opts": "header X-API-TOKEN api.value;"}],
+    indirect=True,
+)
+@pytest.mark.parametrize("trace_service", ["skip_otelcol"], indirect=True)
+def test_exporter_headers_env(client, trace_service, headers):
+    assert client.get("http://127.0.0.1:18080/ok").status_code == 200
+
+    assert trace_service.get_span().name == "/ok"
+
+    metadata = trace_service.last_metadata
+    for name, value in headers.items():
+        assert [v for k, v in metadata if k == name] == (
+            [value] if value else []
+        )
