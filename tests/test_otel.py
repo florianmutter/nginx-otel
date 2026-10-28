@@ -329,3 +329,82 @@ def test_tls_export(client, trace_service):
     assert client.get("http://127.0.0.1:18080/ok").status_code == 200
 
     assert trace_service.get_span().name == "/ok"
+
+
+@pytest.mark.parametrize(
+    ("nginx_env", "nginx_config", "attrs"),
+    [
+        (
+            {"OTEL_SERVICE_NAME": "env_service"},
+            {},
+            {"service.name": "env_service"},
+        ),
+        (
+            {
+                "OTEL_RESOURCE_ATTRIBUTES": (
+                    "service.name=attr_service, my.name = my%20name%2C%3D,"
+                    "my.empty=, ,"
+                )
+            },
+            {},
+            {
+                "service.name": "attr_service",
+                "my.name": "my name,=",
+                "my.empty": "",
+            },
+        ),
+        (
+            {
+                "OTEL_SERVICE_NAME": "env_service",
+                "OTEL_RESOURCE_ATTRIBUTES": "service.name=attr_service",
+            },
+            {},
+            {"service.name": "env_service"},
+        ),
+        (
+            {
+                "OTEL_SERVICE_NAME": "env_service",
+                "OTEL_RESOURCE_ATTRIBUTES": (
+                    "service.name=attr_service,my.name=env,my.env=env"
+                ),
+            },
+            {
+                "resource_attrs": """
+                    otel_service_name test_service;
+                    otel_resource_attr my.name "my name";
+                """
+            },
+            {
+                "service.name": "test_service",
+                "my.name": "my name",
+                "my.env": "env",
+            },
+        ),
+        (
+            {"OTEL_SERVICE_NAME": "env_service"},
+            {"resource_attrs": "otel_resource_attr service.name attr;"},
+            {"service.name": "attr"},
+        ),
+        (
+            {
+                "OTEL_SERVICE_NAME": "env_service",
+                "OTEL_RESOURCE_ATTRIBUTES": "my.name=my%2,my.env=env",
+            },
+            {},
+            {"service.name": "env_service", "my.name": None, "my.env": None},
+        ),
+        (
+            {"OTEL_RESOURCE_ATTRIBUTES": "my.env=env,my.name"},
+            {},
+            {"service.name": "unknown_service:nginx", "my.env": None},
+        ),
+    ],
+    indirect=["nginx_env", "nginx_config"],
+)
+def test_resource_env(client, trace_service, attrs):
+    assert client.get("http://127.0.0.1:18080/ok").status_code == 200
+
+    batch = trace_service.get_batch()
+
+    for name, value in attrs.items():
+        assert get_attr(batch.resource, name) == value
