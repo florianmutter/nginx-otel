@@ -171,6 +171,93 @@ bool iremovePrefix(ngx_str_t* str, StrView p)
     return false;
 }
 
+ngx_str_t getEnv(ngx_conf_t* cf, const char* name)
+{
+    auto value = getenv(name);
+    if (value == NULL) {
+        return {};
+    }
+
+    // copy, as value is modified in place and nginx replaces environment
+    ngx_str_t str{ngx_strlen(value), (u_char*)value};
+    str.data = ngx_pstrdup(cf->pool, &str);
+    if (str.data == NULL) {
+        throw std::bad_alloc();
+    }
+
+    return str;
+}
+
+bool decodeKeyValuePart(u_char* p, u_char* end, StrView* out)
+{
+    while (p < end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+
+    while (p < end && (end[-1] == ' ' || end[-1] == '\t')) {
+        end--;
+    }
+
+    auto start = p;
+    auto dst = p;
+
+    while (p < end) {
+        if (*p != '%') {
+            *dst++ = *p++;
+            continue;
+        }
+
+        auto ch = end - p > 2 ? ngx_hextoi(p + 1, 2) : NGX_ERROR;
+        if (ch == NGX_ERROR) {
+            return false;
+        }
+
+        *dst++ = (u_char)ch;
+        p += 3;
+    }
+
+    *out = StrView((char*)start, dst - start);
+    return true;
+}
+
+// decodes comma-separated "key1=value1,key2=value2" list in place
+bool parseKeyValues(ngx_str_t str,
+    std::vector<std::pair<StrView, StrView>>& kvs)
+{
+    auto p = str.data;
+    auto end = str.data + str.len;
+
+    for ( ;; ) {
+        auto next = ngx_strlchr(p, end, ',');
+        if (next == NULL) {
+            next = end;
+        }
+
+        auto eq = ngx_strlchr(p, next, '=');
+
+        StrView key, value;
+        if (!decodeKeyValuePart(p, eq ? eq : next, &key)) {
+            return false;
+        }
+
+        if (eq) {
+            if (key.empty() || !decodeKeyValuePart(eq + 1, next, &value)) {
+                return false;
+            }
+
+            kvs.emplace_back(key, value);
+        } else if (!key.empty()) {
+            return false;
+        }
+
+        if (next == end) {
+            return true;
+        }
+
+        p = next + 1;
+    }
+}
+
 MainConf* getMainConf(ngx_conf_t* cf)
 {
     return static_cast<MainConf*>(
@@ -816,11 +903,24 @@ char* initMainConf(ngx_conf_t* cf, void* conf)
     ngx_conf_init_size_value(mcf->batchCount, 4);
 
     try {
-        if (mcf->serviceName.data == NULL) {
-            mcf->resourceAttrs.emplace("service.name", "unknown_service:nginx");
-        } else {
+        if (mcf->serviceName.data) {
             mcf->resourceAttrs["service.name"] = toStrView(mcf->serviceName);
         }
+
+        auto name = getEnv(cf, "OTEL_SERVICE_NAME");
+        if (name.len) {
+            mcf->resourceAttrs.emplace("service.name", toStrView(name));
+        }
+
+        std::vector<std::pair<StrView, StrView>> attrs;
+        if (parseKeyValues(getEnv(cf, "OTEL_RESOURCE_ATTRIBUTES"), attrs)) {
+            mcf->resourceAttrs.insert(attrs.begin(), attrs.end());
+        } else {
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                "OTel: ignoring invalid OTEL_RESOURCE_ATTRIBUTES");
+        }
+
+        mcf->resourceAttrs.emplace("service.name", "unknown_service:nginx");
     } catch (const std::exception& e) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "OTel: %s", e.what());
         return (char*)NGX_CONF_ERROR;
