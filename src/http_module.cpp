@@ -6,6 +6,7 @@
 #include "trace_context.hpp"
 #include "batch_exporter.hpp"
 
+#include <algorithm>
 #include <fstream>
 
 extern ngx_module_t gHttpModule;
@@ -726,6 +727,23 @@ void exitWorkerProcess(ngx_cycle_t* cycle)
     gExporter.reset();
 }
 
+void initEndpoint(ngx_conf_t* cf, MainConf* mcf)
+{
+    if (mcf->endpoint.len == 0) {
+        mcf->endpoint = getEnv(cf, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
+    }
+
+    if (mcf->endpoint.len == 0) {
+        mcf->endpoint = getEnv(cf, "OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    if (iremovePrefix(&mcf->endpoint, "https://")) {
+        mcf->ssl = true;
+    } else {
+        iremovePrefix(&mcf->endpoint, "http://");
+    }
+}
+
 char* setExporter(ngx_conf_t* cf, ngx_command_t* cmd, void* conf)
 {
     auto mcf = getMainConf(cf);
@@ -778,10 +796,11 @@ char* setExporter(ngx_conf_t* cf, ngx_command_t* cmd, void* conf)
         return rv;
     }
 
-    if (iremovePrefix(&mcf->endpoint, "https://")) {
-        mcf->ssl = true;
-    } else {
-        iremovePrefix(&mcf->endpoint, "http://");
+    try {
+        initEndpoint(cf, mcf);
+    } catch (const std::exception& e) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "OTel: %s", e.what());
+        return (char*)NGX_CONF_ERROR;
     }
 
     if (mcf->endpoint.len == 0) {
@@ -868,6 +887,44 @@ char* addExporterHeader(ngx_conf_t* cf, ngx_command_t* cmd, void* conf)
     return NGX_CONF_OK;
 }
 
+void addEnvHeaders(ngx_conf_t* cf, MainConf* mcf)
+{
+    auto var = "OTEL_EXPORTER_OTLP_TRACES_HEADERS";
+    auto value = getEnv(cf, var);
+    if (value.len == 0) {
+        var = "OTEL_EXPORTER_OTLP_HEADERS";
+        value = getEnv(cf, var);
+    }
+
+    std::vector<std::pair<StrView, StrView>> headers;
+    bool valid = parseKeyValues(value, headers);
+
+    for (auto it = headers.begin(); valid && it != headers.end(); ++it) {
+        auto name = (u_char*)it->first.data();
+        ngx_strlow(name, name, it->first.size());
+
+        valid = Target::validateHeaderName(it->first) &&
+            Target::validateHeaderValue(it->second);
+    }
+
+    if (!valid) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+            "OTel: ignoring invalid %s", var);
+        return;
+    }
+
+    for (auto& header : headers) {
+        auto found = std::find_if(mcf->headers.begin(), mcf->headers.end(),
+            [&](const Target::HeaderVec::value_type& h) {
+                return StrView(h.first) == header.first;
+            });
+
+        if (found == mcf->headers.end()) {
+            mcf->headers.emplace_back(header.first, header.second);
+        }
+    }
+}
+
 void* createMainConf(ngx_conf_t* cf)
 {
     auto cln = ngx_pool_cleanup_add(cf->pool, sizeof(MainConf));
@@ -921,6 +978,13 @@ char* initMainConf(ngx_conf_t* cf, void* conf)
         }
 
         mcf->resourceAttrs.emplace("service.name", "unknown_service:nginx");
+
+        // no "otel_exporter" block
+        if (mcf->endpoint.len == 0) {
+            initEndpoint(cf, mcf);
+        }
+
+        addEnvHeaders(cf, mcf);
     } catch (const std::exception& e) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "OTel: %s", e.what());
         return (char*)NGX_CONF_ERROR;
